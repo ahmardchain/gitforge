@@ -1,40 +1,46 @@
-// gitforge server (stub): a health probe, the GitHub API root, and a JSON 404
-// for everything else. The real surface — git smart HTTP, REST v3 resources,
-// GraphQL v4 and the MCP endpoint — is built up from here.
+// gitforge server: one Store, four surfaces. Routing order matters only in
+// that each handler claims exactly its own paths and returns false for
+// everything else; anything unclaimed is a JSON 404.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { Store } from './src/store.ts';
+import { pathOf, sendError, sendJson } from './src/http-util.ts';
+import { handleGit } from './src/git-http.ts';
+import { handleRest } from './src/rest.ts';
+import { handleGraphql } from './src/graphql.ts';
+import { handleMcp } from './src/mcp.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
-
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
-
+/** Build the server. It binds nothing until the caller listens; the entry
+ * listens on an ephemeral port. */
 export function createApp(): Server {
+  const store = new Store();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+    void (async () => {
+      try {
+        const path = pathOf(req);
+        const method = req.method ?? 'GET';
 
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
+        // The env's boot check calls this twice: 200 {"ok":true}. No auth.
+        if (method === 'GET' && path === '/healthz') {
+          sendJson(res, 200, { ok: true });
+          return;
+        }
 
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
+        if (await handleGit(store, req, res)) return;
+        if (await handleRest(store, req, res)) return;
+        if (await handleGraphql(store, req, res)) return;
+        if (await handleMcp(store, req, res)) return;
 
-    sendJson(res, 404, { message: 'Not Found' });
+        sendError(res, 404, 'Not Found');
+      } catch {
+        // Never answer HTML and never leak a stack: a plain JSON 500.
+        try {
+          if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
+          else res.destroy();
+        } catch {
+          // The socket is already gone; nothing left to do.
+        }
+      }
+    })();
   });
 }
