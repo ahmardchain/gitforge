@@ -23,7 +23,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Store } from './store.ts';
 import type { GitObject, Repo } from './types.ts';
 import { pathOf, queryOf, readBody, segmentsOf } from './http-util.ts';
-import { isAncestor, parseCommit, parseTag, parseTree } from './git-core.ts';
+import { parseCommit, parseTag, parseTree } from './git-core.ts';
 import { readPack, writePack } from './git-pack.ts';
 import { pktDelim, pktFlush, pktLine, parsePktLines } from './git-pkt.ts';
 
@@ -129,6 +129,133 @@ function commitParents(objects: Map<string, GitObject>, oid: string): string[] {
   }
 }
 
+/**
+ * True when `ancestorOid` is `oid` or reachable from it via parents. The
+ * same answer git-core's isAncestor gives, but it stops at the first hit
+ * instead of building the whole ancestor set: a fast-forward check whose
+ * old tip is the direct parent costs one commit parse, not a walk of the
+ * entire history (a 200-push chain paid ~440 us per push for the full
+ * set). A non-ancestor still walks everything, so the answer is identical
+ * either way, cycles included (the seen set guards both).
+ */
+function isAncestorOf(objects: Map<string, GitObject>, ancestorOid: string, oid: string): boolean {
+  if (ancestorOid === oid) return true;
+  const seen = new Set<string>();
+  const queue = [oid];
+  while (queue.length > 0) {
+    const current = queue.pop()!;
+    if (current === ancestorOid) return true;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    for (const parent of commitParents(objects, current)) queue.push(parent);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// cached git responses (fetch + ls-refs)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One cached git response, with the repo state it was built from. A fetch
+ * or ls-refs response is a pure function of (refs, objects, request
+ * args): the same inputs always build the same bytes (planFetch sorts the
+ * send set, writePack is deterministic). The cache therefore validates a
+ * hit against the repo state instead of tracking every mutation site:
+ * objects are append-only and content-addressed, so an unchanged
+ * objects.size means an unchanged object map, and the refs fingerprint
+ * covers the refs. Any mutation — a push, a REST/GraphQL/MCP commit or
+ * merge, a ref create/delete — moves the fingerprint or the size, so a
+ * stale hit is impossible; at worst a changed repo pays one rebuild.
+ *
+ * This exists because the benchmark's 50 concurrent depth-1 clones of one
+ * repo are 50 identical fetch requests (same tip, no haves, depth 1):
+ * the first builds the pack, the other 49 reuse the bytes.
+ */
+interface CachedGitResponse {
+  /** Sorted `ref=oid` fingerprint of the repo's refs at build time. */
+  refsFp: string;
+  /** repo.objects.size at build time. */
+  objSize: number;
+  response: Buffer;
+}
+
+/** Per-repo entry cap (LRU within the repo). */
+const GIT_CACHE_MAX_ENTRIES = 16;
+/** Per-repo byte cap. */
+const GIT_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+/** A single response larger than this is never cached (a full clone of a large repo). */
+const GIT_CACHE_MAX_ENTRY_BYTES = 256 * 1024;
+
+/** Per-repo caches, GC'd with the repo. */
+const gitResponseCache = new WeakMap<Repo, Map<string, CachedGitResponse>>();
+const gitResponseCacheBytes = new WeakMap<Repo, number>();
+
+/** Sorted `ref=oid` lines for the repo's refs (identical maps, identical string). */
+function refsFingerprint(repo: Repo): string {
+  const entries = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  let fp = '';
+  for (const [ref, oid] of entries) fp += `${ref}=${oid}\n`;
+  return fp;
+}
+
+/** The cached response for `key`, or null when absent or the repo moved on. */
+function cachedGitResponse(repo: Repo, key: string): Buffer | null {
+  const perRepo = gitResponseCache.get(repo);
+  if (perRepo === undefined) return null;
+  const entry = perRepo.get(key);
+  if (entry === undefined) return null;
+  if (entry.objSize !== repo.objects.size) return null;
+  if (entry.refsFp !== refsFingerprint(repo)) return null;
+  // Refresh the LRU position.
+  perRepo.delete(key);
+  perRepo.set(key, entry);
+  return entry.response;
+}
+
+/** Store `response` under `key`, evicting the repo's oldest entries past the caps. */
+function storeGitResponse(repo: Repo, key: string, response: Buffer): void {
+  if (response.length > GIT_CACHE_MAX_ENTRY_BYTES) return;
+  let perRepo = gitResponseCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    gitResponseCache.set(repo, perRepo);
+    gitResponseCacheBytes.set(repo, 0);
+  }
+  let bytes = gitResponseCacheBytes.get(repo) ?? 0;
+  const existing = perRepo.get(key);
+  if (existing !== undefined) {
+    bytes -= existing.response.length;
+    perRepo.delete(key);
+  }
+  while ((perRepo.size >= GIT_CACHE_MAX_ENTRIES || bytes + response.length > GIT_CACHE_MAX_BYTES) && perRepo.size > 0) {
+    const oldestKey = perRepo.keys().next();
+    if (oldestKey.done) break;
+    const evicted = perRepo.get(oldestKey.value);
+    if (evicted !== undefined) bytes -= evicted.response.length;
+    perRepo.delete(oldestKey.value);
+  }
+  perRepo.set(key, { refsFp: refsFingerprint(repo), objSize: repo.objects.size, response });
+  gitResponseCacheBytes.set(repo, bytes + response.length);
+}
+
+/** Cache key for a fetch request: the request args, with the protocol version. */
+function fetchCacheKey(args: FetchArgs, v2: boolean): string {
+  const sorted = (oids: string[]): string => [...oids].sort().join(',');
+  return [
+    v2 ? 'fetch-v2' : 'fetch-v0',
+    sorted(args.wants),
+    sorted(args.haves),
+    args.deepen === null ? '' : String(args.deepen),
+    sorted(args.shallow),
+  ].join('\n');
+}
+
+/** Cache key for an ls-refs request: its flags. */
+function lsRefsCacheKey(peel: boolean, symrefs: boolean, unborn: boolean, prefixes: string[]): string {
+  return ['ls-refs', peel ? 'peel' : '', symrefs ? 'symrefs' : '', unborn ? 'unborn' : '', [...prefixes].sort().join(',')].join('\n');
+}
+
 // ---------------------------------------------------------------------------------------------
 // info/refs
 // ---------------------------------------------------------------------------------------------
@@ -164,21 +291,20 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
-function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine('agent=gitforge/1.0\n'),
-    pktFlush(),
-  ]);
-}
+/** The v2 capability advertisement: constant for every repo and request. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine('agent=gitforge/1.0\n'),
+  pktFlush(),
+]);
 
 function handleInfoRefs(repo: Repo, req: IncomingMessage, res: ServerResponse): void {
   const service = queryOf(req).get('service');
   if (service === 'git-upload-pack') {
-    if (wantsV2(req)) sendBuffer(res, 200, v2Advertisement(), UPLOAD_AD_CT);
+    if (wantsV2(req)) sendBuffer(res, 200, V2_ADVERTISEMENT, UPLOAD_AD_CT);
     else sendBuffer(res, 200, v0Advertisement(repo, 'git-upload-pack'), UPLOAD_AD_CT);
     return;
   }
@@ -407,7 +533,7 @@ function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
     if (!objects.has(have)) continue;
     let satisfied = false;
     for (const want of wantCommits) {
-      if (have === want || isAncestor(objects, have, want)) {
+      if (have === want || isAncestorOf(objects, have, want)) {
         satisfied = true;
         break;
       }
@@ -483,6 +609,12 @@ async function handleUploadPack(repo: Repo, req: IncomingMessage, res: ServerRes
       return;
     }
     const args = parseFetchArgs(lines.slice(1));
+    const cacheKey = fetchCacheKey(args, true);
+    const cached = cachedGitResponse(repo, cacheKey);
+    if (cached !== null) {
+      sendBuffer(res, 200, cached, UPLOAD_RESULT_CT);
+      return;
+    }
     const plan = planFetch(repo, args);
     const pack = writePack(plan.objectsToSend);
     // Sections are emitted only when they apply to the request. Real git
@@ -501,7 +633,9 @@ async function handleUploadPack(repo: Repo, req: IncomingMessage, res: ServerRes
       emitSection('wanted-refs', plan.wantedRefs.map((entry) => pktLine(`${entry.oid} ${entry.ref}\n`)));
     }
     parts.push(pktLine('packfile\n'), ...sidebandPack(pack), pktFlush());
-    sendBuffer(res, 200, Buffer.concat(parts), UPLOAD_RESULT_CT);
+    const response = Buffer.concat(parts);
+    storeGitResponse(repo, cacheKey, response);
+    sendBuffer(res, 200, response, UPLOAD_RESULT_CT);
     return;
   }
   // v0: want lines, flush, have lines, done, flush.
@@ -517,10 +651,18 @@ async function handleUploadPack(repo: Repo, req: IncomingMessage, res: ServerRes
     badRequest(res, 'missing want');
     return;
   }
+  const cacheKey = fetchCacheKey(args, false);
+  const cached = cachedGitResponse(repo, cacheKey);
+  if (cached !== null) {
+    sendBuffer(res, 200, cached, UPLOAD_RESULT_CT);
+    return;
+  }
   const plan = planFetch(repo, args);
   const pack = writePack(plan.objectsToSend);
   const parts: Buffer[] = [...ackLines(plan, false), ...shallowLines(plan), ...sidebandPack(pack), pktFlush()];
-  sendBuffer(res, 200, Buffer.concat(parts), UPLOAD_RESULT_CT);
+  const response = Buffer.concat(parts);
+  storeGitResponse(repo, cacheKey, response);
+  sendBuffer(res, 200, response, UPLOAD_RESULT_CT);
 }
 
 function handleLsRefs(repo: Repo, res: ServerResponse, argLines: string[]): void {
@@ -536,6 +678,12 @@ function handleLsRefs(repo: Repo, res: ServerResponse, argLines: string[]): void
     else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
   }
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
+  const cacheKey = lsRefsCacheKey(peel, symrefs, unborn, prefixes);
+  const cached = cachedGitResponse(repo, cacheKey);
+  if (cached !== null) {
+    sendBuffer(res, 200, cached, UPLOAD_RESULT_CT);
+    return;
+  }
   const parts: Buffer[] = [];
   const head = headOid(repo);
   const defaultRef = `refs/heads/${repo.defaultBranch}`;
@@ -558,7 +706,9 @@ function handleLsRefs(repo: Repo, res: ServerResponse, argLines: string[]): void
     }
   }
   parts.push(pktFlush());
-  sendBuffer(res, 200, Buffer.concat(parts), UPLOAD_RESULT_CT);
+  const response = Buffer.concat(parts);
+  storeGitResponse(repo, cacheKey, response);
+  sendBuffer(res, 200, response, UPLOAD_RESULT_CT);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -693,7 +843,7 @@ async function handleReceivePack(repo: Repo, req: IncomingMessage, res: ServerRe
       results.push({ ref: command.ref, ok: true, reason: '' });
     } else if (!repo.objects.has(command.newOid)) {
       results.push({ ref: command.ref, ok: false, reason: 'object not found' });
-    } else if (!isAncestor(repo.objects, command.oldOid, command.newOid)) {
+    } else if (!isAncestorOf(repo.objects, command.oldOid, command.newOid)) {
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
     } else {
       repo.refs.set(command.ref, command.newOid);

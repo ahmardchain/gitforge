@@ -312,6 +312,85 @@ await check('malformed POST does not kill the server; missing repo info/refs -> 
   assert.equal(healthy2.status, 200, 'known repo should still be 200 after 404s');
 });
 
+// --- 10. long-chain fast-forward pushes (early-exit ancestor walk) -------------
+await check('40 sequential fast-forward pushes on a growing chain all succeed', async () => {
+  store.createRepo(OWNER, 'longchain', { description: 'long chain' });
+  const longSrc = join(TMP, 'long-src');
+  await initSource(longSrc, 'longchain');
+  let tip = '';
+  for (let index = 0; index < 40; index += 1) {
+    tip = await commitIn(longSrc, `f${index}.txt`, `content ${index}\n`, `commit ${index + 1}`);
+    await git(longSrc, ['push', '--quiet', 'origin', 'main:refs/heads/main']);
+    assert.equal((await lsRemote('longchain')).get('refs/heads/main'), tip, `tip after push ${index + 1}`);
+  }
+  // A non-fast-forward push against the long chain is still refused.
+  await git(longSrc, ['checkout', '--quiet', '-b', 'div2', (await git(longSrc, ['rev-parse', 'HEAD~5'])).stdout.trim()]);
+  await commitIn(longSrc, 'div.txt', 'divergent\n', 'divergent');
+  const pushed = await git(longSrc, ['push', 'origin', 'div2:refs/heads/main'], false);
+  assert.notEqual(pushed.status, 0, 'divergent push on a long chain should fail');
+  assert.match(pushed.stderr, /non-fast-forward/);
+  assert.equal((await lsRemote('longchain')).get('refs/heads/main'), tip, 'ref must not move');
+});
+
+// --- 11. identical fetches return identical bytes; a push invalidates them -----
+function pktLine(s: string): Buffer {
+  const body = Buffer.from(s, 'utf8');
+  return Buffer.concat([Buffer.from((body.length + 4).toString(16).padStart(4, '0'), 'ascii'), body]);
+}
+
+async function fetchDepth1(tip: string): Promise<Buffer> {
+  const body = Buffer.concat([
+    pktLine('command=fetch\n'),
+    pktLine('agent=test-git-http/1\n'),
+    pktLine('object-format=sha1\n'),
+    Buffer.from('0001', 'ascii'),
+    pktLine('thin-pack\n'),
+    pktLine('no-progress\n'),
+    pktLine('ofs-delta\n'),
+    pktLine(`want ${tip}\n`),
+    pktLine('deepen 1\n'),
+    pktLine('done\n'),
+    Buffer.from('0000', 'ascii'),
+  ]);
+  const res = await fetch(`${repoUrl('repo')}/git-upload-pack`, {
+    method: 'POST',
+    headers: { 'Git-Protocol': 'version=2', 'Content-Type': 'application/x-git-upload-pack-request' },
+    body,
+  });
+  assert.equal(res.status, 200, `fetch should be 200, got ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+await check('identical depth-1 fetches are byte-identical; a push changes the bytes', async () => {
+  const tipBefore = (await lsRemote('repo')).get('refs/heads/main');
+  assert.ok(tipBefore);
+  const first = await fetchDepth1(tipBefore);
+  const second = await fetchDepth1(tipBefore);
+  assert.ok(first.equals(second), 'identical fetches must return identical bytes');
+  // Push a new commit: the fetch must now carry the new tip, never the cached pack.
+  const c4 = await commitIn(src, 'fourth.txt', 'fourth file\n', 'fourth commit');
+  await git(src, ['push', '--quiet', 'origin', 'main:refs/heads/main']);
+  assert.equal((await lsRemote('repo')).get('refs/heads/main'), c4);
+  const third = await fetchDepth1(c4);
+  assert.ok(!third.equals(first), 'fetch after a push must differ from the pre-push bytes');
+  assert.ok(third.includes(Buffer.from(`shallow ${c4}`, 'ascii')), 'fetch after a push must name the new tip as shallow');
+  const fourth = await fetchDepth1(c4);
+  assert.ok(third.equals(fourth), 'identical fetches after the push must be identical again');
+  // ls-refs is likewise stable while the repo is unchanged.
+  const ls1 = await (await fetch(`${repoUrl('repo')}/git-upload-pack`, {
+    method: 'POST',
+    headers: { 'Git-Protocol': 'version=2', 'Content-Type': 'application/x-git-upload-pack-request' },
+    body: Buffer.concat([pktLine('command=ls-refs\n'), pktLine('peel\n'), pktLine('symrefs\n'), Buffer.from('0000', 'ascii')]),
+  })).arrayBuffer();
+  const ls2 = await (await fetch(`${repoUrl('repo')}/git-upload-pack`, {
+    method: 'POST',
+    headers: { 'Git-Protocol': 'version=2', 'Content-Type': 'application/x-git-upload-pack-request' },
+    body: Buffer.concat([pktLine('command=ls-refs\n'), pktLine('peel\n'), pktLine('symrefs\n'), Buffer.from('0000', 'ascii')]),
+  })).arrayBuffer();
+  assert.ok(Buffer.from(ls1).equals(Buffer.from(ls2)), 'identical ls-refs must return identical bytes');
+  assert.ok(Buffer.from(ls1).includes(Buffer.from(c4, 'ascii')), 'ls-refs must list the new tip');
+});
+
 server.close();
 if (failures > 0) {
   console.log(`${failures} check(s) failed`);
